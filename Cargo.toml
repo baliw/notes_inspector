@@ -1,0 +1,18 @@
+[package]
+name = "notes_inspector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+walkdir = "2"
+pulldown-cmark = "0.12"
+image = "0.25"
+fast_image_resize = { version = "5", features = ["image"] }
+dirs = "5"
+unicode-width = "0.2"
+unicode-segmentation = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+flate2 = "1"
+filetime = "0.2"
