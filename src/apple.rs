@@ -1685,3 +1685,173 @@ pub fn debug_note(note_path: &str) -> String {
 
     out
 }
+
+/// Debug the text processing pipeline for a note — dumps raw text, style runs,
+/// formatted markdown, and final post-processed output to help diagnose rendering issues.
+pub fn debug_note_text(note_path: &str) -> String {
+    let pk: i64 = match note_path.strip_prefix("apple-notes://note/") {
+        Some(pk_str) => match pk_str.parse() {
+            Ok(pk) => pk,
+            Err(_) => return format!("Invalid note ID: {note_path}"),
+        },
+        None => return format!("Invalid note path: {note_path}"),
+    };
+
+    let conn = match open_db_cached() {
+        Ok(c) => c,
+        Err(e) => return format!("DB error: {e}"),
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("=== Text Debug for note PK={pk} ===\n\n"));
+
+    // 1. Get raw data
+    let has_mergeable = conn
+        .prepare("SELECT ZMERGEABLEDATA FROM ZICNOTEDATA LIMIT 0")
+        .is_ok();
+    let sql = if has_mergeable {
+        "SELECT COALESCE(ZDATA, ZMERGEABLEDATA) FROM ZICNOTEDATA WHERE ZNOTE = ?1"
+    } else {
+        "SELECT ZDATA FROM ZICNOTEDATA WHERE ZNOTE = ?1"
+    };
+    let result = conn.query_row(sql, [pk], |row| row.get::<_, Option<Vec<u8>>>(0));
+
+    let data = match result {
+        Ok(Some(data)) => data,
+        Ok(None) => return format!("{out}No content data.\n"),
+        Err(e) => return format!("{out}Query error: {e}\n"),
+    };
+
+    let decompressed = match decompress_gzip(&data) {
+        Some(d) => d,
+        None => return format!("{out}Decompression failed.\n"),
+    };
+
+    let (text, attachments, style_runs) = extract_note_full(&decompressed);
+
+    // 2. Raw extracted text with character positions
+    out.push_str("══════════════════════════════════════\n");
+    out.push_str("RAW TEXT (with char positions)\n");
+    out.push_str("══════════════════════════════════════\n");
+    for (i, ch) in text.chars().enumerate() {
+        if ch == ATTACHMENT_MARKER {
+            out.push_str(&format!("[{i}:U+FFFC]"));
+        } else if ch == '\n' {
+            out.push_str(&format!("[{i}:\\n]\n"));
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push_str("\n\n");
+
+    // 3. Style runs
+    out.push_str("══════════════════════════════════════\n");
+    out.push_str(&format!("STYLE RUNS ({} total)\n", style_runs.len()));
+    out.push_str("══════════════════════════════════════\n");
+    for (i, run) in style_runs.iter().enumerate() {
+        let text_slice: String = text
+            .chars()
+            .skip(run.offset)
+            .take(run.length)
+            .map(|c| if c == ATTACHMENT_MARKER { '\u{2420}' } else if c == '\n' { '\u{21B5}' } else { c })
+            .collect();
+        let mut flags = Vec::new();
+        if run.paragraph != ParagraphStyle::Body {
+            flags.push(format!("para={:?}", run.paragraph));
+        }
+        if run.indent > 0 {
+            flags.push(format!("indent={}", run.indent));
+        }
+        if run.inline_style.bold {
+            flags.push("bold".to_string());
+        }
+        if run.inline_style.italic {
+            flags.push("italic".to_string());
+        }
+        if run.inline_style.underline {
+            flags.push("underline".to_string());
+        }
+        if run.inline_style.strikethrough {
+            flags.push("strikethrough".to_string());
+        }
+        let flags_str = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", flags.join(", "))
+        };
+        out.push_str(&format!(
+            "  {i}: offset={} len={}{flags_str} \"{text_slice}\"\n",
+            run.offset, run.length,
+        ));
+    }
+    out.push('\n');
+
+    // 4. Attachments
+    out.push_str("══════════════════════════════════════\n");
+    out.push_str(&format!("ATTACHMENTS ({} total)\n", attachments.len()));
+    out.push_str("══════════════════════════════════════\n");
+    let att_map = if attachments.is_empty() {
+        HashMap::new()
+    } else {
+        let att_paths = resolve_attachment_paths(&conn, &attachments);
+        let mut map = HashMap::new();
+        for (att, path) in attachments.iter().zip(att_paths.iter()) {
+            let replacement = match path {
+                Some(p) => format!("__INLINE_IMAGE__:{p}"),
+                None => format!("[Attachment not found: {}]", att.uuid),
+            };
+            out.push_str(&format!(
+                "  pos={} uuid={} uti={} -> {}\n",
+                att.position, att.uuid, att.type_uti,
+                path.as_deref().unwrap_or("NOT FOUND")
+            ));
+            map.insert(att.position, replacement);
+        }
+        map
+    };
+    out.push('\n');
+
+    // 5. Formatted markdown (from apply_markdown_formatting)
+    let formatted = crate::export::apply_markdown_formatting(&text, &style_runs, &att_map);
+    out.push_str("══════════════════════════════════════\n");
+    out.push_str("FORMATTED MARKDOWN (apply_markdown_formatting output)\n");
+    out.push_str("══════════════════════════════════════\n");
+    for (i, line) in formatted.split('\n').enumerate() {
+        out.push_str(&format!("{i:3}| {line}\n"));
+    }
+    out.push('\n');
+
+    // 6. Post-processed (with selective hard breaks)
+    let mut post = String::with_capacity(formatted.len() + 256);
+    for line in formatted.split('\n') {
+        let trimmed = line.trim_start();
+        let is_block = trimmed.starts_with('#')
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("- [")
+            || trimmed.starts_with("```")
+            || trimmed.starts_with("---")
+            || trimmed.starts_with('>')
+            || trimmed.is_empty()
+            || trimmed.starts_with("__INLINE_IMAGE__:")
+            || trimmed.chars().next().map_or(false, |c| {
+                c.is_ascii_digit() && trimmed.contains(". ")
+            });
+        if !post.is_empty() {
+            post.push('\n');
+        }
+        post.push_str(line);
+        if !is_block {
+            post.push_str("  ");
+        }
+    }
+    out.push_str("══════════════════════════════════════\n");
+    out.push_str("FINAL POST-PROCESSED (with hard breaks)\n");
+    out.push_str("══════════════════════════════════════\n");
+    for (i, line) in post.split('\n').enumerate() {
+        let trailing = if line.ends_with("  ") { " [HB]" } else { "" };
+        out.push_str(&format!("{i:3}| {line}{trailing}\n"));
+    }
+
+    out
+}

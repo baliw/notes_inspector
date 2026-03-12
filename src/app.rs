@@ -581,16 +581,40 @@ impl App {
                         }
                     }
                 }
+                KeyCode::Char('2') if *source == NoteSource::AppleNotes => {
+                    // Debug: copy note text pipeline info to clipboard
+                    if let Some(item) = flat_items.get(*selected) {
+                        if item.kind == tree::NodeKind::Note {
+                            if let Some(node) = tree::get_node(tree_roots, &item.index_path) {
+                                let path_str = node.path.to_string_lossy().to_string();
+                                let debug_info = crate::apple::debug_note_text(&path_str);
+                                use std::io::Write;
+                                if let Ok(mut child) = std::process::Command::new("pbcopy")
+                                    .stdin(std::process::Stdio::piped())
+                                    .spawn()
+                                {
+                                    if let Some(mut stdin) = child.stdin.take() {
+                                        let _ = stdin.write_all(debug_info.as_bytes());
+                                    }
+                                    let _ = child.wait();
+                                    *error_message = Some("Text debug info copied to clipboard".to_string());
+                                } else {
+                                    *error_message = Some("Failed to run pbcopy".to_string());
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         } else {
             // Note preview scrolling
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    *note_scroll = note_scroll.saturating_sub(1);
+                    *note_scroll = note_scroll.saturating_sub(5);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    *note_scroll += 1;
+                    *note_scroll += 5;
                 }
                 KeyCode::PageUp => {
                     *note_scroll = note_scroll.saturating_sub(20);
@@ -618,6 +642,30 @@ impl App {
                                     }
                                     let _ = child.wait();
                                     *error_message = Some("Debug info copied to clipboard".to_string());
+                                } else {
+                                    *error_message = Some("Failed to run pbcopy".to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('2') if *source == NoteSource::AppleNotes => {
+                    // Debug: copy note text pipeline info to clipboard
+                    if let Some(item) = flat_items.get(*selected) {
+                        if item.kind == tree::NodeKind::Note {
+                            if let Some(node) = tree::get_node(tree_roots, &item.index_path) {
+                                let path_str = node.path.to_string_lossy().to_string();
+                                let debug_info = crate::apple::debug_note_text(&path_str);
+                                use std::io::Write;
+                                if let Ok(mut child) = std::process::Command::new("pbcopy")
+                                    .stdin(std::process::Stdio::piped())
+                                    .spawn()
+                                {
+                                    if let Some(mut stdin) = child.stdin.take() {
+                                        let _ = stdin.write_all(debug_info.as_bytes());
+                                    }
+                                    let _ = child.wait();
+                                    *error_message = Some("Text debug info copied to clipboard".to_string());
                                 } else {
                                     *error_message = Some("Failed to run pbcopy".to_string());
                                 }

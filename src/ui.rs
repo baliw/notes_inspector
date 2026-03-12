@@ -47,7 +47,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 *selected,
                 tree_scroll,
                 note_content.as_deref(),
-                *note_scroll,
+                note_scroll,
                 stats,
                 *focus_tree,
                 attachment_popup,
@@ -276,7 +276,7 @@ fn draw_notes_browser(
     selected: usize,
     tree_scroll: &mut usize,
     note_content: Option<&str>,
-    note_scroll: usize,
+    note_scroll: &mut usize,
     stats: &crate::app::NoteStats,
     focus_tree: bool,
     attachment_popup: &Option<crate::app::AttachmentPopup>,
@@ -439,7 +439,7 @@ fn draw_note_preview(
     f: &mut Frame,
     area: Rect,
     content: Option<&str>,
-    scroll: usize,
+    scroll: &mut usize,
     focused: bool,
     selected_item: Option<&crate::tree::FlatItem>,
 ) {
@@ -535,10 +535,10 @@ fn draw_note_preview(
 
             let visible_height = inner.height as usize;
             let max_scroll = all_lines.len().saturating_sub(visible_height);
-            let actual_scroll = scroll.min(max_scroll);
+            *scroll = (*scroll).min(max_scroll);
             let visible_lines: Vec<Line> = all_lines
                 .into_iter()
-                .skip(actual_scroll)
+                .skip(*scroll)
                 .take(visible_height)
                 .collect();
             let paragraph = Paragraph::new(visible_lines);
@@ -550,11 +550,11 @@ fn draw_note_preview(
 
             let visible_height = inner.height as usize;
             let max_scroll = lines.len().saturating_sub(visible_height);
-            let actual_scroll = scroll.min(max_scroll);
+            *scroll = (*scroll).min(max_scroll);
 
             let visible_lines: Vec<Line> = lines
                 .into_iter()
-                .skip(actual_scroll)
+                .skip(*scroll)
                 .take(visible_height)
                 .collect();
 
@@ -1309,6 +1309,9 @@ fn render_text_with_callouts(text: &str, width: usize) -> Vec<Line<'static>> {
         } else if in_callout {
             // Line doesn't start with `>` — callout ended
             in_callout = false;
+            // Add spacing after the callout
+            all_lines.push(Line::raw(""));
+            all_lines.push(Line::raw(""));
             // Process this line as regular text
             regular_buf.push_str(line);
             regular_buf.push('\n');
@@ -1317,6 +1320,12 @@ fn render_text_with_callouts(text: &str, width: usize) -> Vec<Line<'static>> {
             regular_buf.push_str(line);
             regular_buf.push('\n');
         }
+    }
+
+    // If the text ended while still in a callout, add spacing
+    if in_callout {
+        all_lines.push(Line::raw(""));
+        all_lines.push(Line::raw(""));
     }
 
     // Flush remaining regular text
