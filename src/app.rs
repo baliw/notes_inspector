@@ -25,6 +25,18 @@ pub enum Screen {
         selected: usize,
         scroll_offset: usize,
         message: Option<String>,
+        /// Background vault scan results: None = still scanning, Some = done.
+        found_vaults: Option<Vec<PathBuf>>,
+        /// Shared handle for async vault scan.
+        scan_handle: std::sync::Arc<std::sync::Mutex<Option<Vec<PathBuf>>>>,
+        /// Throbber animation tick.
+        throbber_tick: usize,
+        /// Selected index in the found vaults list.
+        vault_selected: usize,
+        /// Focus: true = folder browser, false = found vaults list.
+        focus_folders: bool,
+        /// Live progress from the background vault scan.
+        scan_progress: obsidian::SharedScanProgress,
     },
     /// Main notes browser with tree + preview.
     NotesBrowser {
@@ -39,8 +51,10 @@ pub enum Screen {
         stats: NoteStats,
         /// Focus: true = tree, false = note preview.
         focus_tree: bool,
-        /// Attachment analysis popup.
-        attachment_popup: Option<AttachmentPopup>,
+        /// Integrity check popup.
+        integrity_popup: Option<IntegrityPopup>,
+        /// Vault config viewer popup.
+        config_popup: Option<ConfigPopup>,
         /// Error message to display.
         error_message: Option<String>,
     },
@@ -83,10 +97,23 @@ pub struct NoteStats {
 }
 
 #[derive(Debug)]
-pub struct AttachmentPopup {
-    pub analysis: obsidian::AttachmentAnalysis,
+pub struct IntegrityPopup {
+    pub result: obsidian::IntegrityResult,
     pub selected: usize,
     pub scroll: usize,
+    /// Visible height computed during last render.
+    pub visible_height: usize,
+}
+
+#[derive(Debug)]
+pub struct ConfigPopup {
+    pub files: Vec<obsidian::ConfigFile>,
+    pub selected: usize,
+    pub content_scroll: usize,
+    /// true = content pane focused, false = file list focused.
+    pub focus_content: bool,
+    /// Max scroll value computed during last render (content_lines - viewport_height).
+    pub max_scroll: usize,
 }
 
 pub struct App {
@@ -116,6 +143,7 @@ impl App {
                 !shared_log.lock().unwrap().is_complete
             }
             Screen::ExportVaultSelect { vaults: None, .. } => true, // scanning
+            Screen::FolderSelect { found_vaults: None, .. } => true, // scanning
             _ => false,
         }
     }
@@ -141,6 +169,20 @@ impl App {
                     }
                 }
             }
+            Screen::FolderSelect {
+                found_vaults,
+                scan_handle,
+                throbber_tick,
+                ..
+            } => {
+                if found_vaults.is_none() {
+                    *throbber_tick = throbber_tick.wrapping_add(1);
+                    let mut handle = scan_handle.lock().unwrap();
+                    if handle.is_some() {
+                        *found_vaults = handle.take();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -151,7 +193,7 @@ impl App {
         !matches!(
             &self.screen,
             Screen::NotesBrowser {
-                attachment_popup: Some(_),
+                integrity_popup: Some(_),
                 ..
             }
         )
@@ -215,12 +257,31 @@ impl App {
                     NoteSource::Obsidian => {
                         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
                         let entries = obsidian::list_subdirs(&home);
+                        let scan_handle = std::sync::Arc::new(std::sync::Mutex::new(None));
+                        let handle_clone = scan_handle.clone();
+                        let home_clone = home.clone();
+                        let scan_progress: obsidian::SharedScanProgress =
+                            std::sync::Arc::new(std::sync::Mutex::new(obsidian::ScanProgress {
+                                folders_searched: 0,
+                                current_path: String::new(),
+                            }));
+                        let progress_clone = scan_progress.clone();
+                        std::thread::spawn(move || {
+                            let found = obsidian::find_vaults_with_progress(&home_clone, 4, &progress_clone);
+                            *handle_clone.lock().unwrap() = Some(found);
+                        });
                         self.screen = Screen::FolderSelect {
                             current_path: home,
                             entries,
                             selected: 0,
                             scroll_offset: 0,
                             message: None,
+                            found_vaults: None,
+                            scan_handle,
+                            throbber_tick: 0,
+                            vault_selected: 0,
+                            focus_folders: true,
+                            scan_progress,
                         };
                     }
                     NoteSource::AppleNotes => match crate::apple::build_notes_tree() {
@@ -242,7 +303,8 @@ impl App {
                                 note_scroll: 0,
                                 stats,
                                 focus_tree: true,
-                                attachment_popup: None,
+                                integrity_popup: None,
+                                config_popup: None,
                                 error_message: None,
                             };
                         }
@@ -260,18 +322,91 @@ impl App {
     }
 
     fn handle_folder_select(&mut self, key: KeyEvent) {
-        // Extract fields we need - take ownership of screen temporarily
+        // Extract fields we need
         let Screen::FolderSelect {
             ref mut current_path,
             ref mut entries,
             ref mut selected,
             ref mut scroll_offset,
             ref mut message,
+            ref found_vaults,
+            ref mut vault_selected,
+            ref mut focus_folders,
+            ..
         } = self.screen
         else {
             return;
         };
 
+        // Tab switches focus between found vaults and folder browser
+        if key.code == KeyCode::Tab {
+            if let Some(vaults) = found_vaults {
+                if !vaults.is_empty() {
+                    *focus_folders = !*focus_folders;
+                }
+            }
+            return;
+        }
+
+        if !*focus_folders {
+            // Navigating the found vaults list
+            let vault_count = found_vaults.as_ref().map_or(0, |v| v.len());
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if *vault_selected > 0 {
+                        *vault_selected -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *vault_selected < vault_count.saturating_sub(1) {
+                        *vault_selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(vaults) = found_vaults {
+                        if let Some(path) = vaults.get(*vault_selected).cloned() {
+                            let tree = obsidian::build_vault_tree(&path);
+                            let stats = NoteStats {
+                                total_notes: tree.count_notes(),
+                                total_folders: tree.count_folders(),
+                                total_attachments: tree.count_attachments(),
+                                vault_name: tree.name.clone(),
+                            };
+                            let flat = tree::flatten_tree(&[tree.clone()]);
+                            self.screen = Screen::NotesBrowser {
+                                source: NoteSource::Obsidian,
+                                tree_roots: vec![tree],
+                                flat_items: flat,
+                                selected: 0,
+                                tree_scroll: 0,
+                                note_content: None,
+                                note_scroll: 0,
+                                stats,
+                                focus_tree: true,
+                                integrity_popup: None,
+                                config_popup: None,
+                                error_message: None,
+                            };
+                            return;
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    self.screen = Screen::SourceSelect {
+                        selected: 0,
+                        options: vec![
+                            ("Apple Notes", NoteSource::AppleNotes),
+                            ("Obsidian", NoteSource::Obsidian),
+                        ],
+                        error_message: None,
+                    };
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Navigating the folder browser
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if *selected > 0 {
@@ -308,7 +443,8 @@ impl App {
                             note_scroll: 0,
                             stats,
                             focus_tree: true,
-                            attachment_popup: None,
+                            integrity_popup: None,
+                            config_popup: None,
                             error_message: None,
                         };
                         return;
@@ -361,8 +497,10 @@ impl App {
             ref mut tree_scroll,
             ref mut note_content,
             ref mut note_scroll,
+            ref mut stats,
             ref mut focus_tree,
-            ref mut attachment_popup,
+            ref mut integrity_popup,
+            ref mut config_popup,
             ref mut error_message,
             ..
         } = self.screen
@@ -370,11 +508,66 @@ impl App {
             return;
         };
 
-        // Handle attachment popup
-        if let Some(popup) = attachment_popup {
+        // Handle config popup
+        if let Some(popup) = config_popup {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    *attachment_popup = None;
+                    if popup.focus_content {
+                        popup.focus_content = false;
+                    } else {
+                        *config_popup = None;
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    popup.focus_content = false;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    popup.focus_content = true;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if popup.focus_content {
+                        popup.content_scroll = popup.content_scroll.saturating_sub(5);
+                    } else if popup.selected > 0 {
+                        popup.selected -= 1;
+                        popup.content_scroll = 0;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if popup.focus_content {
+                        popup.content_scroll = (popup.content_scroll + 5).min(popup.max_scroll);
+                    } else if popup.selected < popup.files.len().saturating_sub(1) {
+                        popup.selected += 1;
+                        popup.content_scroll = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Handle integrity check popup
+        if let Some(popup) = integrity_popup {
+            let issue_count = popup.result.issues.len();
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    *integrity_popup = None;
+                    // Rebuild tree in case files were deleted
+                    if let Some(root) = tree_roots.first() {
+                        let path = root.path.clone();
+                        let new_tree = obsidian::build_vault_tree(&path);
+                        *stats = NoteStats {
+                            total_notes: new_tree.count_notes(),
+                            total_folders: new_tree.count_folders(),
+                            total_attachments: new_tree.count_attachments(),
+                            vault_name: new_tree.name.clone(),
+                        };
+                        *tree_roots = vec![new_tree];
+                        *flat_items = tree::flatten_tree(tree_roots);
+                        if *selected >= flat_items.len() {
+                            *selected = flat_items.len().saturating_sub(1);
+                        }
+                        *note_content = None;
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if popup.selected > 0 {
@@ -385,8 +578,30 @@ impl App {
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if popup.selected < popup.analysis.unlinked.len().saturating_sub(1) {
+                    if popup.selected < issue_count.saturating_sub(1) {
                         popup.selected += 1;
+                        if popup.selected >= popup.scroll + popup.visible_height {
+                            popup.scroll = popup.selected - popup.visible_height + 1;
+                        }
+                    }
+                }
+                KeyCode::Char('d') => {
+                    // Delete the selected unlinked attachment
+                    if popup.selected < issue_count {
+                        if let obsidian::IntegrityIssue::UnlinkedAttachment { ref path } =
+                            popup.result.issues[popup.selected]
+                        {
+                            if obsidian::delete_file(path).is_ok() {
+                                popup.result.issues.remove(popup.selected);
+                                popup.result.unlinked_attachments =
+                                    popup.result.unlinked_attachments.saturating_sub(1);
+                                if popup.selected >= popup.result.issues.len()
+                                    && popup.selected > 0
+                                {
+                                    popup.selected -= 1;
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -493,15 +708,28 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('a') if *source == NoteSource::Obsidian => {
-                    // Open attachment analysis
+                KeyCode::Char('i') if *source == NoteSource::Obsidian => {
+                    // Run integrity check
                     if let Some(root) = tree_roots.first() {
-                        let analysis =
-                            obsidian::analyze_attachments(&root.path);
-                        *attachment_popup = Some(AttachmentPopup {
-                            analysis,
+                        let result = obsidian::check_integrity(&root.path);
+                        *integrity_popup = Some(IntegrityPopup {
+                            result,
                             selected: 0,
                             scroll: 0,
+                            visible_height: 0,
+                        });
+                    }
+                }
+                KeyCode::Char('c') if *source == NoteSource::Obsidian => {
+                    // Show vault config
+                    if let Some(root) = tree_roots.first() {
+                        let files = obsidian::read_vault_config(&root.path);
+                        *config_popup = Some(ConfigPopup {
+                            files,
+                            selected: 0,
+                            content_scroll: 0,
+                            focus_content: false,
+                            max_scroll: 0,
                         });
                     }
                 }
@@ -823,7 +1051,8 @@ impl App {
                             note_scroll: 0,
                             stats,
                             focus_tree: true,
-                            attachment_popup: None,
+                            integrity_popup: None,
+                            config_popup: None,
                             error_message: None,
                         };
                     }
@@ -970,7 +1199,8 @@ impl App {
                             note_scroll: 0,
                             stats,
                             focus_tree: true,
-                            attachment_popup: None,
+                            integrity_popup: None,
+                            config_popup: None,
                             error_message: None,
                         };
                     }

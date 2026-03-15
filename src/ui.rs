@@ -17,6 +17,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             selected,
             scroll_offset,
             message,
+            found_vaults,
+            throbber_tick,
+            vault_selected,
+            focus_folders,
+            scan_progress,
+            ..
         } => {
             draw_folder_select(
                 f,
@@ -25,6 +31,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 *selected,
                 *scroll_offset,
                 message.as_deref(),
+                found_vaults.as_deref(),
+                *throbber_tick,
+                *vault_selected,
+                *focus_folders,
+                scan_progress,
             );
         }
         Screen::NotesBrowser {
@@ -36,7 +47,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             note_scroll,
             stats,
             focus_tree,
-            attachment_popup,
+            integrity_popup,
+            config_popup,
             error_message,
             ..
         } => {
@@ -50,7 +62,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 note_scroll,
                 stats,
                 *focus_tree,
-                attachment_popup,
+                integrity_popup,
+                config_popup,
                 error_message.as_deref(),
             );
         }
@@ -112,14 +125,32 @@ fn draw_source_select(
 
     // Center the menu
     let has_error = error_message.is_some();
-    let menu_height = options.len() as u16 + if has_error { 10 } else { 6 };
-    let menu_width = 60;
-    let menu_area = centered_rect(menu_width, menu_height, area);
+    let options_chunk_height = options.len() as u16 + 3; // +3 for border (2) + padding (1)
+    let menu_height = 2 + 2 + options_chunk_height + if has_error { 3 } else { 0 } + 2;
+    let menu_width: u16 = 30;
+
+    // Center vertically with absolute height, horizontally with percentage
+    let v_center = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(menu_height),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+    let menu_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - menu_width) / 2),
+            Constraint::Percentage(menu_width),
+            Constraint::Percentage((100 - menu_width) / 2),
+        ])
+        .split(v_center[1])[1];
 
     let mut constraints = vec![
         Constraint::Length(2),
         Constraint::Length(2),
-        Constraint::Length(options.len() as u16 + 1),
+        Constraint::Length(options_chunk_height),
     ];
     if has_error {
         constraints.push(Constraint::Length(3));
@@ -144,8 +175,8 @@ fn draw_source_select(
         .map(|(i, (name, _))| {
             let style = if i == selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
@@ -155,7 +186,13 @@ fn draw_source_select(
         })
         .collect();
 
-    let list = List::new(items);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
     f.render_widget(list, chunks[2]);
 
     // Error message (if any)
@@ -176,6 +213,7 @@ fn draw_source_select(
     f.render_widget(help, chunks[help_idx]);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_folder_select(
     f: &mut Frame,
     current_path: &str,
@@ -183,32 +221,132 @@ fn draw_folder_select(
     selected: usize,
     scroll_offset: usize,
     message: Option<&str>,
+    found_vaults: Option<&[std::path::PathBuf]>,
+    throbber_tick: usize,
+    vault_selected: usize,
+    focus_folders: bool,
+    scan_progress: &crate::obsidian::SharedScanProgress,
 ) {
     let area = f.area();
+
+    // Determine vault discovery frame height
+    let vault_frame_height: u16 = match found_vaults {
+        None => 3,      // "Searching..." single line
+        Some(v) if v.is_empty() => 3, // "No vaults found"
+        Some(v) => (v.len() as u16 + 2).min(8), // vaults + border, capped
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(vault_frame_height),
             Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(3),
         ])
         .split(area);
 
+    // Vault discovery frame
+    let vault_border_color = if !focus_folders && found_vaults.is_some_and(|v| !v.is_empty()) {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    match found_vaults {
+        None => {
+            // Still scanning - show throbber with live progress
+            let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let spinner = spinner_chars[throbber_tick % spinner_chars.len()];
+            let (folders_searched, scan_path) = {
+                let prog = scan_progress.lock().unwrap();
+                (prog.folders_searched, prog.current_path.clone())
+            };
+            let vault_block = Block::default()
+                .title(" Obsidian Vaults ")
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow));
+            // Truncate path to fit in available width
+            let inner_width = chunks[0].width.saturating_sub(2) as usize;
+            let prefix = format!(" {spinner} Searching ({folders_searched}) ");
+            let max_path_len = inner_width.saturating_sub(prefix.len());
+            let display_path = if scan_path.len() > max_path_len {
+                let start = scan_path.len() - max_path_len.saturating_sub(1);
+                format!("…{}", &scan_path[start..])
+            } else {
+                scan_path
+            };
+            let searching = Paragraph::new(format!("{prefix}{display_path}"))
+                .style(Style::default().fg(Color::Yellow))
+                .block(vault_block);
+            f.render_widget(searching, chunks[0]);
+        }
+        Some(vaults) if vaults.is_empty() => {
+            let vault_block = Block::default()
+                .title(" Obsidian Vaults ")
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray));
+            let none_found = Paragraph::new(" No vaults found")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(vault_block);
+            f.render_widget(none_found, chunks[0]);
+        }
+        Some(vaults) => {
+            let vault_block = Block::default()
+                .title(format!(" {} Obsidian Vault{} Found ",
+                    vaults.len(),
+                    if vaults.len() == 1 { "" } else { "s" }))
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(vault_border_color));
+            let inner_height = vault_frame_height.saturating_sub(2) as usize;
+            let vault_scroll = if vault_selected >= inner_height {
+                vault_selected - inner_height + 1
+            } else {
+                0
+            };
+            let items: Vec<ListItem> = vaults
+                .iter()
+                .enumerate()
+                .skip(vault_scroll)
+                .take(inner_height)
+                .map(|(i, path)| {
+                    let name = path.to_string_lossy().to_string();
+                    let style = if i == vault_selected && !focus_folders {
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Green)
+                    };
+                    ListItem::new(format!(" ♦ {name}")).style(style)
+                })
+                .collect();
+            let list = List::new(items).block(vault_block);
+            f.render_widget(list, chunks[0]);
+        }
+    }
+
     // Path header
+    let path_border_color = if focus_folders { Color::Cyan } else { Color::DarkGray };
     let path_block = Block::default()
         .title(" Select Obsidian Vault ")
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(path_border_color));
     let path_text = Paragraph::new(current_path)
         .style(Style::default().fg(Color::Yellow))
         .block(path_block);
-    f.render_widget(path_text, chunks[0]);
+    f.render_widget(path_text, chunks[1]);
 
     // Directory list
-    let visible_height = chunks[1].height.saturating_sub(2) as usize;
+    let visible_height = chunks[2].height.saturating_sub(2) as usize;
     let scroll = if selected >= scroll_offset + visible_height {
         selected.saturating_sub(visible_height) + 1
     } else {
@@ -228,7 +366,7 @@ fn draw_folder_select(
                 .to_string();
             let is_vault = crate::obsidian::is_obsidian_vault(path);
             let icon = if is_vault { "♦ " } else { "▪ " };
-            let style = if i == selected {
+            let style = if i == selected && focus_folders {
                 Style::default()
                     .fg(Color::Black)
                     .bg(if is_vault { Color::Green } else { Color::Cyan })
@@ -245,27 +383,30 @@ fn draw_folder_select(
     let list_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(if focus_folders { Color::DarkGray } else { Color::Rgb(40, 40, 40) }))
         .title(if let Some(msg) = message {
             format!(" {msg} ")
         } else {
             format!(" {} items ", entries.len())
         });
     let list = List::new(items).block(list_block);
-    f.render_widget(list, chunks[1]);
+    f.render_widget(list, chunks[2]);
 
     // Help footer
     let help_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
-    let help = Paragraph::new(
-        "↑↓/jk: Navigate  Enter: Open  Backspace/←: Parent  Esc: Back  Green = Vault",
-    )
-    .style(Style::default().fg(Color::DarkGray))
-    .alignment(Alignment::Center)
-    .block(help_block);
-    f.render_widget(help, chunks[2]);
+    let help_text = if found_vaults.is_some_and(|v| !v.is_empty()) {
+        "↑↓/jk: Navigate  Enter: Open  Tab: Switch pane  Backspace/←: Parent  Esc: Back"
+    } else {
+        "↑↓/jk: Navigate  Enter: Open  Backspace/←: Parent  Esc: Back  Green = Vault"
+    };
+    let help = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center)
+        .block(help_block);
+    f.render_widget(help, chunks[3]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -279,7 +420,8 @@ fn draw_notes_browser(
     note_scroll: &mut usize,
     stats: &crate::app::NoteStats,
     focus_tree: bool,
-    attachment_popup: &Option<crate::app::AttachmentPopup>,
+    integrity_popup: &mut Option<crate::app::IntegrityPopup>,
+    config_popup: &mut Option<crate::app::ConfigPopup>,
     error_message: Option<&str>,
 ) {
     let area = f.area();
@@ -313,9 +455,15 @@ fn draw_notes_browser(
     // Footer
     draw_footer(f, main_chunks[2], source, focus_tree, error_message);
 
-    // Attachment popup overlay
-    if let Some(popup) = attachment_popup {
-        draw_attachment_popup(f, area, popup);
+    // Integrity check popup overlay
+    if let Some(popup) = integrity_popup {
+        draw_integrity_popup(f, area, popup);
+    }
+
+
+    // Config viewer popup overlay
+    if let Some(popup) = config_popup {
+        draw_config_popup(f, area, popup);
     }
 }
 
@@ -590,12 +738,12 @@ fn draw_footer(
     let base_help = match source {
         NoteSource::Obsidian => {
             format!(
-                "{focus_indicator}  ↑↓/jk: Navigate  ←→/hl: Collapse/Expand  Tab: Switch pane  a: Attachments  Esc: Back  q: Quit"
+                "{focus_indicator}  ↑↓/jk: Navigate  ←→/hl: Collapse/Expand  Tab: Switch pane  i: Integrity  c: Config  Esc: Back  q: Quit"
             )
         }
         NoteSource::AppleNotes => {
             format!(
-                "{focus_indicator}  ↑↓/jk: Navigate  ←→/hl: Collapse/Expand  Tab: Switch pane  d: Debug  e: Export  Esc: Back  q: Quit"
+                "{focus_indicator}  ↑↓/jk: Navigate  ←→/hl: Collapse/Expand  Tab: Switch pane  d: Debug Attachments  2: Debug Text  e: Export  Esc: Back  q: Quit"
             )
         }
     };
@@ -613,16 +761,25 @@ fn draw_footer(
     f.render_widget(paragraph, area);
 }
 
-fn draw_attachment_popup(f: &mut Frame, area: Rect, popup: &crate::app::AttachmentPopup) {
+fn draw_integrity_popup(f: &mut Frame, area: Rect, popup: &mut crate::app::IntegrityPopup) {
+    use crate::obsidian::IntegrityIssue;
+
     // Dim background
     let dim = Block::default().style(Style::default().bg(Color::Black));
     f.render_widget(dim, area);
 
-    // Popup centered
-    let popup_area = centered_rect(70, 80, area);
+    // Popup centered, max 50% width and height
+    let popup_area = centered_rect(50, 50, area);
+
+    let issue_count = popup.result.issues.len();
+    let title = if issue_count == 0 {
+        " Integrity Check — All Clear ".to_string()
+    } else {
+        format!(" Integrity Check — {} Issue{} ", issue_count, if issue_count == 1 { "" } else { "s" })
+    };
 
     let block = Block::default()
-        .title(" Attachment Analysis ")
+        .title(title)
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -639,57 +796,219 @@ fn draw_attachment_popup(f: &mut Frame, area: Rect, popup: &crate::app::Attachme
 
     // Summary
     let summary = format!(
-        "Total: {}  |  Linked: {}  |  Unlinked: {}",
-        popup.analysis.total_attachments,
-        popup.analysis.linked_attachments,
-        popup.analysis.unlinked.len()
+        "Notes: {}  |  Attachments: {}  |  Broken links: {}  |  Unlinked: {}",
+        popup.result.notes_scanned,
+        popup.result.attachments_scanned,
+        popup.result.broken_links,
+        popup.result.unlinked_attachments,
     );
     let summary_widget = Paragraph::new(summary)
         .style(Style::default().fg(Color::White))
         .alignment(Alignment::Center);
     f.render_widget(summary_widget, chunks[0]);
 
-    // Unlinked files list
-    let visible_height = chunks[1].height as usize;
-    let scroll = if popup.selected >= popup.scroll + visible_height {
-        popup.selected.saturating_sub(visible_height) + 1
+    // Issues list
+    if issue_count == 0 {
+        let ok = Paragraph::new("No issues found.")
+            .style(Style::default().fg(Color::Green))
+            .alignment(Alignment::Center);
+        f.render_widget(ok, chunks[1]);
     } else {
-        popup.scroll
-    };
+        let visible_height = chunks[1].height.saturating_sub(1) as usize; // -1 for border
+        popup.visible_height = visible_height;
+        let scroll = popup.scroll;
 
+        let items: Vec<ListItem> = popup
+            .result
+            .issues
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible_height)
+            .map(|(i, issue)| {
+                let (icon, text, base_color) = match issue {
+                    IntegrityIssue::BrokenLink { source_note, link_target } => {
+                        let note_name = source_note
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        ("⚠", format!("{link_target}  ← {note_name}"), Color::Red)
+                    }
+                    IntegrityIssue::UnlinkedAttachment { path } => {
+                        let fname = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        ("●", format!("{fname}  (unlinked)"), Color::Yellow)
+                    }
+                };
+                let style = if i == popup.selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(base_color)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(base_color)
+                };
+                ListItem::new(format!("  {icon} {text}")).style(style)
+            })
+            .collect();
+
+        let list_block = Block::default()
+            .title(" Issues ")
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let list = List::new(items).block(list_block);
+        f.render_widget(list, chunks[1]);
+    }
+
+    // Help — show delete option when an unlinked attachment is selected
+    let help_text = if issue_count > 0 {
+        let is_unlinked = matches!(
+            popup.result.issues.get(popup.selected),
+            Some(IntegrityIssue::UnlinkedAttachment { .. })
+        );
+        if is_unlinked {
+            "↑↓/jk: Navigate  d: Delete attachment  Esc/q: Close"
+        } else {
+            "↑↓/jk: Navigate  Esc/q: Close"
+        }
+    } else {
+        "Esc/q: Close"
+    };
+    let help = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[2]);
+}
+
+fn draw_config_popup(f: &mut Frame, area: Rect, popup: &mut crate::app::ConfigPopup) {
+    // Dim background
+    let dim = Block::default().style(Style::default().bg(Color::Black));
+    f.render_widget(dim, area);
+
+    // Popup centered, max 50% width and height
+    let popup_area = centered_rect(50, 50, area);
+
+    let title = format!(
+        " Vault Config — {} file{} ",
+        popup.files.len(),
+        if popup.files.len() == 1 { "" } else { "s" }
+    );
+    let block = Block::default()
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(popup_area);
+    f.render_widget(Clear, popup_area);
+    f.render_widget(block, popup_area);
+
+    if popup.files.is_empty() {
+        let empty = Paragraph::new("No config files found.")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        f.render_widget(empty, inner);
+        return;
+    }
+
+    // Split into file list (left) and content (right)
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(28), Constraint::Min(0)])
+        .split(inner);
+
+    // Left: file list (full height minus help line)
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(panes[0]);
+
+    let visible_height = left_chunks[0].height as usize;
+    let file_scroll = if popup.selected >= visible_height {
+        popup.selected - visible_height + 1
+    } else {
+        0
+    };
     let items: Vec<ListItem> = popup
-        .analysis
-        .unlinked
+        .files
         .iter()
         .enumerate()
-        .skip(scroll)
+        .skip(file_scroll)
         .take(visible_height)
-        .map(|(i, path)| {
-            let name = path.to_string_lossy().to_string();
+        .map(|(i, cf)| {
             let style = if i == popup.selected {
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Yellow)
+                    .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-            ListItem::new(format!("  · {name}")).style(style)
+            ListItem::new(format!(" {}", cf.name)).style(style)
         })
         .collect();
 
+    let list_border_color = if popup.focus_content { Color::DarkGray } else { Color::Cyan };
     let list_block = Block::default()
-        .title(" Unlinked Attachments (candidates for pruning) ")
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(list_border_color));
     let list = List::new(items).block(list_block);
-    f.render_widget(list, chunks[1]);
+    f.render_widget(list, left_chunks[0]);
 
-    // Help
-    let help = Paragraph::new("↑↓/jk: Navigate  Esc/q: Close")
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center);
-    f.render_widget(help, chunks[2]);
+    // Help in bottom-left
+    let left_help = if popup.focus_content { " ←: Files" } else { " ↑↓ →: View  Esc/q" };
+    let help = Paragraph::new(left_help)
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(help, left_chunks[1]);
+
+    // Right: file content
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(panes[1]);
+
+    if let Some(cf) = popup.files.get(popup.selected) {
+        let content_lines: Vec<&str> = cf.content.lines().collect();
+        let content_height = right_chunks[0].height as usize;
+        let max_scroll = content_lines.len().saturating_sub(content_height);
+        popup.max_scroll = max_scroll;
+        popup.content_scroll = popup.content_scroll.min(max_scroll);
+        let scroll = popup.content_scroll;
+
+        let visible: String = content_lines
+            .iter()
+            .skip(scroll)
+            .take(content_height)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let content_color = if popup.focus_content { Color::White } else { Color::DarkGray };
+        let content_widget = Paragraph::new(visible)
+            .style(Style::default().fg(content_color));
+        f.render_widget(content_widget, right_chunks[0]);
+
+        // Scroll indicator
+        let indicator = if content_lines.len() > content_height {
+            format!(
+                " {}-{}/{}  ↑↓: Scroll  ←: Files",
+                scroll + 1,
+                (scroll + content_height).min(content_lines.len()),
+                content_lines.len()
+            )
+        } else if popup.focus_content {
+            " ←: Files".to_string()
+        } else {
+            String::new()
+        };
+        let scroll_info = Paragraph::new(indicator)
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Right);
+        f.render_widget(scroll_info, right_chunks[1]);
+    }
 }
 
 /// Create a centered rect using percentage of parent area.
@@ -1267,9 +1586,34 @@ fn render_text_with_callouts(text: &str, width: usize) -> Vec<Line<'static>> {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     let mut regular_buf = String::new();
     let mut in_callout = false;
+    let mut consecutive_blanks: usize = 0;
 
     for line in text.split('\n') {
         let trimmed = line.trim();
+
+        // Track consecutive blank lines outside callouts so we can preserve
+        // the original spacing (pulldown-cmark would normalize them away).
+        if trimmed.is_empty() && !in_callout {
+            consecutive_blanks += 1;
+            if consecutive_blanks <= 1 {
+                // Buffer the first blank line for markdown paragraph breaks
+                regular_buf.push('\n');
+            }
+            continue;
+        }
+
+        // When we hit non-blank content after 2+ blank lines, flush the
+        // buffer and emit the extra blank lines directly.
+        if consecutive_blanks > 1 {
+            if !regular_buf.is_empty() {
+                all_lines.extend(markdown::markdown_to_lines(&regular_buf, width));
+                regular_buf.clear();
+            }
+            for _ in 1..consecutive_blanks {
+                all_lines.push(Line::raw(""));
+            }
+        }
+        consecutive_blanks = 0;
 
         if !in_callout && trimmed.starts_with("> [!") {
             // Flush any regular text accumulated so far
@@ -1326,6 +1670,15 @@ fn render_text_with_callouts(text: &str, width: usize) -> Vec<Line<'static>> {
     if in_callout {
         all_lines.push(Line::raw(""));
         all_lines.push(Line::raw(""));
+    }
+
+    // Handle trailing consecutive blanks
+    if consecutive_blanks > 1 && !regular_buf.is_empty() {
+        all_lines.extend(markdown::markdown_to_lines(&regular_buf, width));
+        regular_buf.clear();
+        for _ in 1..consecutive_blanks {
+            all_lines.push(Line::raw(""));
+        }
     }
 
     // Flush remaining regular text

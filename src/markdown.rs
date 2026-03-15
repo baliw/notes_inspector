@@ -22,11 +22,32 @@ pub fn markdown_to_lines(content: &str, width: usize) -> Vec<Line<'static>> {
     let mut heading_level: Option<u8> = None;
     let mut list_depth: usize = 0;
     let mut in_list_item = false;
+    // Deferred blank line from End(Paragraph): emitted before the next block
+    // element, but suppressed when a list immediately follows (so paragraphs
+    // like bold-styled labels don't get an unwanted gap before their list).
+    let mut pending_blank = false;
 
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(content, options);
 
     for event in parser {
+        // Consume a deferred paragraph break before new block-level content.
+        if pending_blank {
+            match &event {
+                Event::Start(Tag::List(_)) => {
+                    // Suppress blank line — list follows paragraph directly
+                    pending_blank = false;
+                }
+                Event::End(_) => {
+                    // Don't consume on End events (e.g. End(Item), End(List))
+                }
+                _ => {
+                    lines.push(Line::raw(""));
+                    pending_blank = false;
+                }
+            }
+        }
+
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -39,6 +60,8 @@ pub fn markdown_to_lines(content: &str, width: usize) -> Vec<Line<'static>> {
                     in_code_block = true;
                 }
                 Tag::List(_) => {
+                    // Flush any pending text (e.g. parent item text before nested list)
+                    push_line(&mut lines, &mut current_spans);
                     list_depth += 1;
                 }
                 Tag::Item => {
@@ -89,7 +112,6 @@ pub fn markdown_to_lines(content: &str, width: usize) -> Vec<Line<'static>> {
                     let prefix = "#".repeat(level as usize);
                     current_spans = vec![Span::styled(format!("{prefix} {text}"), style)];
                     push_line(&mut lines, &mut current_spans);
-                    lines.push(Line::raw(""));
                 }
                 TagEnd::Strong => bold = false,
                 TagEnd::Emphasis => italic = false,
@@ -99,7 +121,11 @@ pub fn markdown_to_lines(content: &str, width: usize) -> Vec<Line<'static>> {
                 }
                 TagEnd::Paragraph => {
                     push_line(&mut lines, &mut current_spans);
-                    lines.push(Line::raw(""));
+                    if list_depth == 0 {
+                        // Defer the blank line — it will be suppressed if
+                        // a list follows, or emitted before other content.
+                        pending_blank = true;
+                    }
                 }
                 TagEnd::Item => {
                     in_list_item = false;

@@ -659,6 +659,10 @@ pub(crate) fn apply_markdown_formatting(
     let mut numbered_counter: u32 = 0;
     let mut prev_was_list = false;
     let mut in_callout = false;
+    // Tracks a blank non-list line that followed a list item, so we can
+    // insert an HTML comment to split what would otherwise be one loose list
+    // into separate tight lists (preserving the original inter-group spacing).
+    let mut blank_after_list = false;
 
     // Split into lines by tracking newline characters
     let mut line_start = 0;
@@ -807,6 +811,16 @@ pub(crate) fn apply_markdown_formatting(
             }
         };
 
+        // When a list item follows a blank line that came after a previous
+        // list group, insert an HTML comment to force pulldown-cmark to treat
+        // them as separate tight lists instead of one loose list.
+        if blank_after_list && is_list {
+            output.push_str("<!-- -->\n\n");
+        }
+        if blank_after_list && (!trimmed.is_empty() || is_list) {
+            blank_after_list = false;
+        }
+
         if is_notes_opener && !in_callout {
             // Start an info callout block
             in_callout = true;
@@ -821,6 +835,9 @@ pub(crate) fn apply_markdown_formatting(
             output.push_str(&line_content);
         } else if trimmed.is_empty() && !is_list {
             // Don't add heading prefixes to blank lines, but keep empty list items for spacing
+            if prev_was_list {
+                blank_after_list = true;
+            }
             if in_callout {
                 output.push('>');
             }
@@ -892,11 +909,8 @@ pub(crate) fn apply_markdown_formatting(
 
     // No remaining attachments to handle — position-based lookup covers all
 
-    // Clean up
-    let mut text = output.replace("\r\n", "\n").replace('\r', "\n");
-    while text.contains("\n\n\n") {
-        text = text.replace("\n\n\n", "\n\n");
-    }
+    // Clean up line endings but preserve original blank line spacing
+    let text = output.replace("\r\n", "\n").replace('\r', "\n");
     text.trim().to_string()
 }
 
